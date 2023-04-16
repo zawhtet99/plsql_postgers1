@@ -1,0 +1,437 @@
+-- Function: playground1.fn_emergency_credits(date)
+
+-- DROP FUNCTION playground1.fn_emergency_credits(date);
+
+CREATE OR REPLACE FUNCTION playground1.fn_emergency_credits(idate date)
+  RETURNS integer AS
+$BODY$
+
+/*
+	-- Daily run
+	SELECT ADS.F_TR_006(null);
+	
+	-- Re-run
+	SELECT ADS.F_TR_006('2014-08-01');
+*/
+
+DECLARE
+	Z_ops_date		DATE;
+	Z_etl_cycle_id	INT;
+
+BEGIN
+	RAISE NOTICE '[INFO]: Loading data....';
+
+	SELECT ops_date, etl_cycle_id FROM OPS.DOPS_PARAMETERS
+	INTO Z_ops_date, Z_etl_cycle_id;
+	
+	IF iDATE IS NOT NULL THEN
+		Z_ops_date = idate;
+
+	END IF; 
+	
+/* Loans Taken */
+	DROP TABLE IF EXISTS tmp_loans_taken;
+	
+	CREATE TEMP TABLE tmp_loans_taken ( 
+	cbs_subscriber_id integer
+	, subscriber_msisdn character varying(25)
+	, loan_taken numeric
+	, loan_date timestamp)
+	DISTRIBUTED BY (cbs_subscriber_id); 
+	
+	INSERT INTO tmp_loans_taken 
+		(cbs_subscriber_id, subscriber_msisdn, loan_taken, loan_date)
+	SELECT subscriberkey as cbs_subscriber_id, chargingpartynumber as msisdn, (loanamount/100.00) as loan_taken, timestamp as loan_date
+	FROM --stg.vou_day
+	ssd.cbs_vou_cdr
+	WHERE timestamp::DATE = Z_ops_date
+	AND loanamount/100.00 in (500,800,1600) 
+	AND tradetype = 1007 
+	AND loanamount > 0;
+	
+	DROP TABLE IF EXISTS tmp_loans_taken1;
+	
+	CREATE TEMP TABLE tmp_loans_taken1 ( 
+	cbs_subscriber_id integer
+	, subscriber_msisdn character varying(25)
+	, loan_taken numeric
+	, loan_date date)
+	DISTRIBUTED BY (cbs_subscriber_id);
+	
+	INSERT INTO tmp_loans_taken1 
+	(cbs_subscriber_id, subscriber_msisdn, loan_taken, loan_date)
+	SELECT cbs_subscriber_id, subscriber_msisdn, sum(loan_taken), loan_date::date as loan_date
+	FROM tmp_loans_taken
+	GROUP BY 1, 2, 4;
+
+/* Loans Repaid */
+	DROP TABLE IF EXISTS tmp_loans_paid;
+	
+	CREATE TEMP TABLE tmp_loans_paid ( 
+    cbs_subscriber_id integer
+	, subscriber_msisdn character varying(25)
+	, repay_amount numeric
+	, repay_date timestamp)
+	DISTRIBUTED BY (cbs_subscriber_id); 
+
+	INSERT INTO tmp_loans_paid 
+		(cbs_subscriber_id, subscriber_msisdn, repay_amount, repay_date)
+	SELECT
+	cbs_subscriber_id, msisdn, loan_paid, timestamp 
+	FROM
+	(SELECT subscriberkey as cbs_subscriber_id, chargingpartynumber as msisdn, loanamount/100.00 loan_paid, timestamp 
+	FROM --stg.mgr_day
+	ssd.cbs_mgr_cdr
+	WHERE timestamp::DATE = Z_ops_date 
+	AND loanamount > 0
+	UNION ALL
+	SELECT subscriberkey as cbs_subscriber_id, chargingpartynumber as msisdn, loanamount/100.00 loan_paid, timestamp 
+	FROM --stg.vou_day
+	ssd.cbs_vou_cdr
+	WHERE timestamp::DATE = Z_ops_date 
+	AND tradetype <> 1007
+	AND loanamount > 0) all_p;
+
+
+	DROP TABLE IF EXISTS tmp_loans_paid1;
+	
+	CREATE TEMP TABLE tmp_loans_paid1 ( 
+	cbs_subscriber_id integer
+	, subscriber_msisdn character varying(25)
+	, repay_amount numeric
+	, repay_date date)
+	DISTRIBUTED BY (cbs_subscriber_id); 
+	
+	INSERT INTO tmp_loans_paid1 
+		(cbs_subscriber_id, subscriber_msisdn, repay_amount, repay_date)
+	SELECT cbs_subscriber_id, subscriber_msisdn, sum(repay_amount), repay_date::date as repay_date
+	FROM tmp_loans_paid
+	GROUP BY 1, 2, 4;	
+	
+	/* Merging Loans and Repayments */
+	DROP TABLE IF EXISTS tmp_taken_repay;
+	
+	CREATE TEMP TABLE tmp_taken_repay ( 
+	  trans_flag character varying(2)
+	, cbs_subscriber_id integer
+	, subscriber_msisdn character varying(25)
+	, tot_taken numeric
+	, tot_repay numeric)
+	DISTRIBUTED BY (cbs_subscriber_id); 	
+
+	INSERT INTO tmp_taken_repay 
+		(trans_flag, cbs_subscriber_id, subscriber_msisdn, tot_taken, tot_repay)
+	SELECT 
+	CASE WHEN tot_taken > 0 AND tot_repay > 0 THEN 'LR'
+	     WHEN tot_taken > 0 THEN 'L'
+	     WHEN tot_repay > 0 THEN 'R'
+	ELSE NULL
+	END AS trans_flag
+	, cbs_subscriber_id, subscriber_msisdn
+	, tot_taken, tot_repay
+	FROM (
+		SELECT COALESCE(l.cbs_subscriber_id, p.cbs_subscriber_id) AS cbs_subscriber_id
+		, COALESCE(l.subscriber_msisdn, p.subscriber_msisdn) AS subscriber_msisdn
+		, SUM(COALESCE(l.loan_taken, 0)) AS tot_taken, SUM(COALESCE(p.repay_amount, 0)) AS tot_repay
+		FROM tmp_loans_taken1 l
+		FULL OUTER JOIN 
+		tmp_loans_paid1 p
+		ON l.cbs_subscriber_id = p.cbs_subscriber_id
+		GROUP BY 1, 2) t_all;	
+	
+	/* Start of SCD Processing */
+	DROP TABLE IF EXISTS tmp_emergency_credit_dlt;
+	
+	CREATE TEMP TABLE tmp_emergency_credit_dlt ( 
+	cbs_subscriber_id integer
+	, subscriber_msisdn character varying(15)
+	, last_loan_amount numeric
+	, last_loan_date date
+	, last_loan_repaid numeric
+	, last_repay_date date
+	, lifetime_loan_amount numeric
+	, lifetime_loan_repaid numeric) 
+	DISTRIBUTED BY (cbs_subscriber_id); 
+
+	INSERT INTO tmp_emergency_credit_dlt
+	(cbs_subscriber_id, subscriber_msisdn, last_loan_amount, last_loan_date
+	, last_loan_repaid, last_repay_date, lifetime_loan_amount, lifetime_loan_repaid)
+	SELECT ec.cbs_subscriber_id, ec.subscriber_msisdn, ec.last_loan_amount, ec.last_loan_date
+	, ec.last_loan_repaid, ec.last_repay_date, ec.lifetime_loan_amount, ec.lifetime_loan_repaid
+	FROM playground1.subscriber_emergency_credit ec
+	JOIN tmp_taken_repay ttr
+	ON ttr.cbs_subscriber_id = ec.cbs_subscriber_id
+	AND ec.scd_end = '2999-12-31';
+
+	/* Updating Subscriber Emergency Credit Balance */
+
+	/* Processing Subscribers with EC Loans Only */	
+	UPDATE tmp_emergency_credit_dlt dlt
+	SET 
+		  last_loan_date = Z_ops_date
+		, last_loan_amount = ttr.tot_taken
+		, lifetime_loan_amount = coalesce(lifetime_loan_amount,0) + coalesce(ttr.tot_taken,0)
+		, last_repay_date = NULL
+		, last_loan_repaid = 0
+	FROM tmp_taken_repay ttr
+	WHERE ttr.cbs_subscriber_id = dlt.cbs_subscriber_id
+	AND ttr.trans_flag = 'L';
+
+	/* Processing Subscribers with EC Repayments Only */	
+	UPDATE tmp_emergency_credit_dlt dlt
+	SET 
+		  last_repay_date = Z_ops_date		
+		, last_loan_repaid = ttr.tot_repay
+		, lifetime_loan_repaid = coalesce(lifetime_loan_repaid,0) + ttr.tot_repay
+	FROM tmp_taken_repay ttr
+	WHERE ttr.cbs_subscriber_id = dlt.cbs_subscriber_id
+	AND ttr.trans_flag = 'R';
+
+	/* Processing Subscribers with EC Loans and Repayments */	
+	UPDATE tmp_emergency_credit_dlt dlt
+	SET 
+		  last_loan_date = Z_ops_date
+		, last_loan_amount = coalesce(ttr.tot_taken,0)
+		, lifetime_loan_amount = coalesce(lifetime_loan_amount,0) + coalesce(ttr.tot_taken,0)		
+		, last_repay_date = Z_ops_date		
+		, last_loan_repaid = ttr.tot_repay
+		, lifetime_loan_repaid = coalesce(lifetime_loan_repaid,0) + ttr.tot_repay
+	FROM tmp_taken_repay ttr
+	WHERE ttr.cbs_subscriber_id = dlt.cbs_subscriber_id
+	AND ttr.trans_flag = 'LR';
+	
+	/* Closing current records that have changed */
+	UPDATE playground1.subscriber_emergency_credit ec
+		SET scd_end = Z_ops_date - 1
+	FROM tmp_emergency_credit_dlt dlt
+	WHERE ec.cbs_subscriber_id = dlt.cbs_subscriber_id
+	AND ec.scd_end = '2999-12-31';
+
+	/* Inserting updated EC records */	
+	INSERT INTO playground1.subscriber_emergency_credit 
+		(data_date, cbs_subscriber_id, subscriber_msisdn, last_loan_amount, last_loan_date, last_loan_repaid
+		 , last_repay_date, lifetime_loan_amount, lifetime_loan_repaid, scd_end, load_dt, etl_cycle_id)
+	SELECT 
+		Z_ops_date, cbs_subscriber_id, subscriber_msisdn, last_loan_amount, last_loan_date, last_loan_repaid
+		, last_repay_date, lifetime_loan_amount, lifetime_loan_repaid, '2999-12-31', current_date, Z_etl_cycle_id
+	FROM tmp_emergency_credit_dlt;
+		
+	/* Creating Subscribers with First ever EC */
+	INSERT INTO playground1.subscriber_emergency_credit 
+		(data_date, cbs_subscriber_id, subscriber_msisdn, last_loan_amount
+		, last_loan_date, last_loan_repaid, last_repay_date, lifetime_loan_amount, lifetime_loan_repaid
+		, scd_end, load_dt, etl_cycle_id)
+	SELECT Z_ops_date, tlt.cbs_subscriber_id, tlt.subscriber_msisdn, COALESCE(tot_taken, 0) AS last_loan_amount
+	, (CASE WHEN COALESCE(tot_taken, 0) > 0 THEN Z_ops_date ELSE NULL END) AS last_loan_date, COALESCE(tot_repay,0)
+	, CASE WHEN COALESCE(tot_repay,0) > 0 THEN  Z_ops_date ELSE NULL END, COALESCE(tot_taken, 0) AS lifetime_loan_amount, COALESCE(tot_repay,0) AS lifetime_loan_repaid
+	, '2999-12-31', current_date, Z_etl_cycle_id
+	FROM tmp_taken_repay tlt
+	LEFT JOIN playground1.subscriber_emergency_credit ec
+	ON tlt.cbs_subscriber_id = ec.cbs_subscriber_id
+	WHERE ec.cbs_subscriber_id IS NULL;
+
+	
+	/* Processing Loan Aging */
+	DROP TABLE IF EXISTS tmp_subscriber_status_ec;
+	
+	CREATE TEMP TABLE tmp_subscriber_status_ec ( 
+	cbs_subscriber_id integer
+	, subscriber_msisdn character varying(15)
+	, subscriber_status character varying(5)
+	, last_loan_amount numeric
+	, last_loan_date timestamp
+	, last_loan_repaid numeric
+	, last_repay_date timestamp
+	, lifetime_loan_amount numeric
+	, lifetime_loan_repaid numeric)
+	DISTRIBUTED BY (cbs_subscriber_id); 
+	
+	DROP TABLE IF EXISTS tmp_crm_subs_status;
+	
+	CREATE temp TABLE tmp_crm_subs_status as
+	SELECT sub_id AS crm_subscriber_key, cs.msisdn as msisdn, sub_state AS subscriber_status
+	FROM (select sub_id, msisdn, sub_state, row_number() over (partition by msisdn order by exp_date desc) AS rn 
+	FROM ssd.crm_subscriber 
+	WHERE load_dt = Z_ops_date + 1) cs
+	WHERE cs.rn = 1;	
+
+
+	INSERT INTO tmp_subscriber_status_ec 
+	(cbs_subscriber_id, subscriber_msisdn, subscriber_status, last_loan_amount, last_loan_date
+	, last_loan_repaid, last_repay_date, lifetime_loan_amount, lifetime_loan_repaid)
+	SELECT DISTINCT ec.cbs_subscriber_id, ec.subscriber_msisdn, ad.subscriber_status, COALESCE(ec.last_loan_amount,0), COALESCE(ec.last_loan_date,'2999-12-31') 
+	, COALESCE(ec.last_loan_repaid,0), ec.last_repay_date, COALESCE(ec.lifetime_loan_amount,0), COALESCE(ec.lifetime_loan_repaid,0)
+	FROM playground1.subscriber_emergency_credit ec
+	JOIN tmp_crm_subs_status ad
+	ON ec.subscriber_msisdn = ad.msisdn
+	WHERE scd_end = '2999-12-31';
+
+	/* Loan Ageing - Last Loan Date */
+	DELETE FROM playground1.loan_aging_summary WHERE data_date = Z_ops_date;
+	
+	INSERT INTO playground1.loan_aging_summary
+	(data_date, subscriber_status, loan_age_code, loan_age_amount, loan_age_count, load_dt, etl_cycle_id)
+	SELECT Z_ops_date, subscriber_status, '0-7 days', sum(lifetime_loan_amount - lifetime_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM tmp_subscriber_status_ec
+	WHERE (lifetime_loan_amount - lifetime_loan_repaid) > 0
+	AND Z_ops_date - last_loan_date BETWEEN 0 and 7
+	GROUP BY subscriber_status
+	UNION ALL
+	SELECT Z_ops_date, subscriber_status, '8-14 days', sum(lifetime_loan_amount - lifetime_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM tmp_subscriber_status_ec
+	WHERE (lifetime_loan_amount - lifetime_loan_repaid) > 0
+	AND Z_ops_date - last_loan_date BETWEEN 8 and 14
+	GROUP BY subscriber_status
+	UNION ALL
+	SELECT Z_ops_date, subscriber_status, '15-21 days', sum(lifetime_loan_amount - lifetime_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM tmp_subscriber_status_ec
+	WHERE (lifetime_loan_amount - lifetime_loan_repaid) > 0
+	AND Z_ops_date - last_loan_date BETWEEN 15 and 21
+	GROUP BY subscriber_status
+	UNION ALL
+	SELECT Z_ops_date, subscriber_status, '22-30 days', sum(lifetime_loan_amount - lifetime_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM tmp_subscriber_status_ec
+	WHERE (lifetime_loan_amount - lifetime_loan_repaid) > 0
+	AND Z_ops_date - last_loan_date BETWEEN 22 and 30
+	GROUP BY subscriber_status
+	UNION ALL
+	SELECT Z_ops_date, subscriber_status, '31-60 days', sum(lifetime_loan_amount - lifetime_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM tmp_subscriber_status_ec
+	WHERE (lifetime_loan_amount - lifetime_loan_repaid) > 0
+	AND Z_ops_date - last_loan_date BETWEEN 31 and 60
+	GROUP BY subscriber_status
+	UNION ALL
+	SELECT Z_ops_date, subscriber_status, '61-90 days', sum(lifetime_loan_amount - lifetime_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM tmp_subscriber_status_ec
+	WHERE (lifetime_loan_amount - lifetime_loan_repaid) > 0
+	AND Z_ops_date - last_loan_date BETWEEN 61 and 90
+	GROUP BY subscriber_status
+	UNION ALL
+	SELECT Z_ops_date, subscriber_status, 'Over 90 days', sum(lifetime_loan_amount - lifetime_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM tmp_subscriber_status_ec
+	WHERE (lifetime_loan_amount - lifetime_loan_repaid) > 0
+	AND Z_ops_date - last_loan_date > 90
+	GROUP BY subscriber_status;	
+	
+	/* Loan Ageing - Last Repay Date */
+	DELETE FROM playground1.loan_aging_summary_repay WHERE data_date = Z_ops_date;
+	
+	INSERT INTO playground1.loan_aging_summary_repay
+	(data_date, subscriber_status, loan_age_code, loan_age_amount, loan_age_count, load_dt, etl_cycle_id)
+	SELECT Z_ops_date, subscriber_status, '0-7 days', sum(lifetime_loan_amount - lifetime_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM tmp_subscriber_status_ec
+	WHERE (lifetime_loan_amount - lifetime_loan_repaid) > 0
+	AND Z_ops_date - last_repay_date BETWEEN 0 and 7
+	GROUP BY subscriber_status
+	UNION ALL
+	SELECT Z_ops_date, subscriber_status, '8-14 days', sum(lifetime_loan_amount - lifetime_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM tmp_subscriber_status_ec
+	WHERE (lifetime_loan_amount - lifetime_loan_repaid) > 0
+	AND Z_ops_date - last_repay_date BETWEEN 8 and 14
+	GROUP BY subscriber_status
+	UNION ALL
+	SELECT Z_ops_date, subscriber_status, '15-21 days', sum(lifetime_loan_amount - lifetime_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM tmp_subscriber_status_ec
+	WHERE (lifetime_loan_amount - lifetime_loan_repaid) > 0
+	AND Z_ops_date - last_repay_date BETWEEN 15 and 21
+	GROUP BY subscriber_status
+	UNION ALL
+	SELECT Z_ops_date, subscriber_status, '22-30 days', sum(lifetime_loan_amount - lifetime_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM tmp_subscriber_status_ec
+	WHERE (lifetime_loan_amount - lifetime_loan_repaid) > 0
+	AND Z_ops_date - last_repay_date BETWEEN 22 and 30
+	GROUP BY subscriber_status
+	UNION ALL
+	SELECT Z_ops_date, subscriber_status, '31-60 days', sum(lifetime_loan_amount - lifetime_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM tmp_subscriber_status_ec
+	WHERE (lifetime_loan_amount - lifetime_loan_repaid) > 0
+	AND Z_ops_date - last_repay_date BETWEEN 31 and 60
+	GROUP BY subscriber_status
+	UNION ALL
+	SELECT Z_ops_date, subscriber_status, '61-90 days', sum(lifetime_loan_amount - lifetime_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM tmp_subscriber_status_ec
+	WHERE (lifetime_loan_amount - lifetime_loan_repaid) > 0
+	AND Z_ops_date - last_repay_date BETWEEN 61 and 90
+	GROUP BY subscriber_status
+	UNION ALL
+	SELECT Z_ops_date, subscriber_status, 'Over 90 days', sum(lifetime_loan_amount - lifetime_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM tmp_subscriber_status_ec
+	WHERE (lifetime_loan_amount - lifetime_loan_repaid) > 0
+	AND Z_ops_date - last_repay_date > 90
+	GROUP BY subscriber_status;	
+	
+	
+RETURN 0;
+
+	EXCEPTION
+		WHEN OTHERS THEN	
+		RAISE EXCEPTION '[ERROR]: % | %', SQLSTATE, SQLERRM;
+
+	RETURN 1;
+	
+END;
+
+$BODY$
+  LANGUAGE plpgsql VOLATILE;
+ALTER FUNCTION playground1.fn_emergency_credits(date)
+  OWNER TO zhtet5;
+
+========================================================
+CREATE TABLE playground1.loan_aging_summary
+(
+  data_date date,
+  subscriber_status character varying(5),
+  loan_age_code character varying(15),
+  loan_age_amount numeric,
+  loan_age_count integer,
+  load_dt date,
+  etl_cycle_id integer,
+  load_time timestamp without time zone DEFAULT now()
+)
+WITH (
+  OIDS=FALSE
+)
+DISTRIBUTED RANDOMLY;
+ALTER TABLE playground1.loan_aging_summary
+  OWNER TO zhtet5;
+GRANT ALL ON TABLE playground1.loan_aging_summary TO zhtet5;
+=================================================================
+CREATE TABLE playground1.loan_aging_summary_repay
+(
+  data_date date NOT NULL,
+  subscriber_status character varying(5) NOT NULL,
+  loan_age_code character varying(15) NOT NULL,
+  loan_age_amount numeric,
+  loan_age_count integer,
+  load_dt date NOT NULL DEFAULT now(),
+  etl_cycle_id integer,
+  load_time timestamp without time zone DEFAULT now()
+)
+WITH (
+  OIDS=FALSE
+)
+DISTRIBUTED RANDOMLY;
+ALTER TABLE playground1.loan_aging_summary_repay
+  OWNER TO zhtet5;
+GRANT ALL ON TABLE playground1.loan_aging_summary_repay TO zhtet5;
+=========================================================================
+CREATE TABLE playground1.loan_aging_summary
+(
+  data_date date,
+  subscriber_status character varying(5),
+  loan_age_code character varying(15),
+  loan_age_amount numeric,
+  loan_age_count integer,
+  load_dt date,
+  etl_cycle_id integer,
+  load_time timestamp without time zone DEFAULT now()
+)
+WITH (
+  OIDS=FALSE
+)
+DISTRIBUTED RANDOMLY;
+ALTER TABLE playground1.loan_aging_summary
+  OWNER TO zhtet5;
+GRANT ALL ON TABLE playground1.loan_aging_summary TO zhtet5;
+=============================================================================
+
