@@ -1,0 +1,82 @@
+-- Function: playground1.kzhfn_prod_activate_day(date)
+
+-- DROP FUNCTION playground1.kzhfn_prod_activate_day(date);
+
+CREATE OR REPLACE FUNCTION playground1.kzhfn_prod_activate_day(idate date)
+  RETURNS integer AS
+$BODY$
+BEGIN
+
+drop table if exists tmp_take1;
+create temp  table tmp_take1 as (
+select distinct aaa.subscriber_msisdn, aaa.subscriber_status, aaa.subscriber_activation_date::date, bbb.customer_level_name, bbb.crm_customer_id,aaa.crm_subscriber_key,
+aaa.subscriber_prepaid_flag
+from ads.subscriber aaa
+left outer join (
+select b.customer_id, b.crm_customer_id, c.customer_level_name
+from ads.customer b
+join ads.ref_customer_level c
+on b.customer_type = c.customer_level_id) bbb
+on aaa.customer_id = bbb.customer_id
+where aaa.current_primary_offer_id in (select offer_id from ads.ref_b2b_primary_plan) and aaa.subscriber_status not in ('B06', 'B02') and aaa.subscriber_activation_date::date = idate 
+);
+
+create temp table tmp_take2 as (
+select aaa.*, bbb.offer_name product_name, bbb.eff_date as Product_activation_date, bbb.subscribe_channel, bbb.primary_flag
+from tmp_take1 aaa
+left outer join(
+select a.sub_id, a.offer_id, a.eff_date, b.offer_name, a.subscribe_channel, a.primary_flag
+from ssd.crm_inf_offers a
+join stg.crm_pdm_offer b
+on a.offer_id = b.offer_id 
+where a.offer_id in (select z.offer_id from playground1.ref_offer1 z)) bbb
+on aaa.crm_subscriber_key = bbb.sub_id);
+
+drop table if exists tmp_take3;
+create temp table tmp_take3 as
+select a.*,b.channel_name
+from tmp_take2 a
+left join ads.ref_crm_channel_id_name b 
+on a.subscribe_channel = b.channel_id
+distributed randomly;
+
+drop table if exists tmp_take4;
+create temp table tmp_take4 as
+select a.*,b.total_revenue
+from tmp_take3 a
+left join rdl.subscriber_daily_summary b 
+on a.crm_subscriber_key = b.subscriber_id  
+where b.data_date::date=idate
+distributed randomly;
+
+drop table if exists tmp_take5;
+create temp table tmp_take5 as
+select a.*,b.site,b.mkttownship,b.cluster
+from tmp_take4 a
+left join playground_mkt1.rpt_b2b_kpi_msisdn_region_daily_v3 b
+on a.crm_subscriber_key = b.subscriber_id
+distributed randomly;
+
+drop table if exists playground1.kzh_product_activation_day;
+create table playground1.kzh_product_activation_day as
+select subscriber_msisdn,subscriber_status,subscriber_activation_date,customer_level_name customer_level,crm_subscriber_key subscriber_id,
+product_name offer,product_activation_date,channel_name,total_revenue,site,mkttownship,cluster
+from tmp_take5
+distributed randomly;
+
+
+RETURN 0;			
+
+	EXCEPTION
+		WHEN OTHERS THEN	
+	RAISE EXCEPTION '[ERROR]: % | %', SQLSTATE, SQLERRM;
+	RETURN 1;	
+
+END;
+
+$BODY$
+  LANGUAGE plpgsql VOLATILE;
+ALTER FUNCTION playground1.kzhfn_prod_activate_day(date)
+  OWNER TO zhtet5;
+GRANT EXECUTE ON FUNCTION playground1.kzhfn_prod_activate_day(date) TO public;
+GRANT EXECUTE ON FUNCTION playground1.kzhfn_prod_activate_day(date) TO zhtet5;
