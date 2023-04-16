@@ -1,0 +1,11 @@
+WRITABLE
+CREATE WRITABLE EXTERNAL TABLE EXT.ads_non_traffic_rated_cdr_1_prt_com (LIKE ads.non_traffic_rated_cdr) LOCATION ('gpfdist://sdw1:14002/ads.non_traffic_rated_cdr_1_prt_com_1.csv','gpfdist://sdw2:14002/ads.non_traffic_rated_cdr_1_prt_com_2.csv','gpfdist://sdw3:14002/ads.non_traffic_rated_cdr_1_prt_com_3.csv','gpfdist://sdw4:14002/ads.non_traffic_rated_cdr_1_prt_com_4.csv','gpfdist://sdw5:14002/ads.non_traffic_rated_cdr_1_prt_com_5.csv','gpfdist://sdw6:14002/ads.non_traffic_rated_cdr_1_prt_com_6.csv','gpfdist://sdw7:14002/ads.non_traffic_rated_cdr_1_prt_com_7.csv','gpfdist://sdw8:14002/ads.non_traffic_rated_cdr_1_prt_com_8.csv','gpfdist://sdw9:14002/ads.non_traffic_rated_cdr_1_prt_com_9.csv','gpfdist://sdw10:14002/ads.non_traffic_rated_cdr_1_prt_com_10.csv','gpfdist://sdw11:14002/ads.non_traffic_rated_cdr_1_prt_com_11.csv','gpfdist://sdw12:14002/ads.non_traffic_rated_cdr_1_prt_com_12.csv','gpfdist://sdw13:14002/ads.non_traffic_rated_cdr_1_prt_com_13.csv','gpfdist://sdw14:14002/ads.non_traffic_rated_cdr_1_prt_com_14.csv','gpfdist://sdw15:14002/ads.non_traffic_rated_cdr_1_prt_com_15.csv','gpfdist://sdw16:14002/ads.non_traffic_rated_cdr_1_prt_com_16.csv') FORMAT 'TEXT' (DELIMITER '|') ENCODING 'UTF8' Distributed Randomly; 
+
+INSERT 
+insert into ext.ads_mss_cdr_tgt_1_prt_d20170603 select * from ads.mss_cdr_tgt_1_prt_d20170603;
+
+READABLE
+CREATE READABLE EXTERNAL TABLE ext.cbs_account_1_prt_d20170101( like cbs_account_1_prt_d20170101) LOCATION  ('gpfdist://10.54.23.103:14000/cbs_account_1_prt_d20170101.csv') FORMAT  'TEXT' ( DELIMITER '|') ENCODING 'UTF8'  LOG ERRORS INTO err.rated_call_1_prt_d20170902SEGMENT REJECT LIMIT 5 ROWS;
+
+INSERT
+insert into ads.cbs_account_1_prt_d20170101 select * from ext.cbs_account_1_prt_d20170101
