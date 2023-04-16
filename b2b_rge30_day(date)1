@@ -1,0 +1,111 @@
+-- Function: playground1.kzhfn_b2b_rge30_day(date)
+
+-- DROP FUNCTION playground1.kzhfn_b2b_rge30_day(date);
+
+CREATE OR REPLACE FUNCTION playground1.kzhfn_b2b_rge30_day(idate date)
+  RETURNS integer AS
+$BODY$
+BEGIN
+
+
+drop table if exists egargu1;
+create temp table egargu1 as
+select a.*,
+(case when a.eff_date=idate then 'gargu1' 
+when a.eff_date=idate-1 then 'gargu2'
+when a.eff_date=idate-2 then 'gargu3'
+ELSE 'NA' END) flag
+from rdl.b2b_subscribers a 
+where a.sub_state like 'B01' and (eff_date <= idate and eff_date >= idate::date-2)
+distributed randomly;
+
+drop table if exists egargu2;
+create temp table egargu2 as
+select a.*,
+(case when a.flag like 'gargu3' and b.flag like 'gargu1' and b.flag not like 'gargu2' then 'rejoiner' 
+when a.flag not like 'gargu3' and b.flag like 'gargu2' and b.flag not like 'gargu1' then 'churn'
+when a.flag not like 'gargu3' and b.flag like 'gargu2' and b.flag like 'gargu1' then 'stayer'
+when a.flag not like 'gargu3' and b.flag not like 'gargu2' and b.flag like 'gargu1' then 'gargu'
+ELSE 'NA' END) status
+from egargu1 a, egargu1 b
+where a.subscriber_id=b.subscriber_id
+distributed randomly;
+
+delete from egargu2 where flag like 'NA' or status like 'NA';
+
+drop table if exists egargu3;
+create temp table egargu3 as
+select distinct a.*,b.flag rge
+from egargu2 a
+left join 
+rdl.rpt_rgu_rge_site_wise_details  b
+on a.subscriber_id=b.subscriber_id 
+where b.data_date>='2018-01-01' and b.flag like 'rge30'
+distributed randomly;
+
+drop table if exists etake1;
+create temp table etake1 as
+select a.*,b.cust_id
+from egargu3 a
+left join stg.crm_subscriber b 
+on a.subscriber_id = b.sub_id
+distributed randomly;
+
+drop table if exists etake2;
+create temp table etake2 as
+select a.*,b.cust_level
+from etake1 a
+left join stg.crm_inf_customer_all b 
+on a.cust_id = b.cust_id
+distributed randomly;
+
+drop table if exists etake3;
+create temp table etake3 as
+select a.*,b.customer_level_name
+from etake2 a
+left join ads.ref_customer_level b 
+on a.cust_level = b.customer_level_id
+distributed randomly;
+
+drop table if exists etake4;
+create temp table etake4 as
+select a.*,b.site,b.mkttownship,b.cluster
+from etake3 a
+left join playground_mkt1.rpt_b2b_kpi_msisdn_region_daily_v2 b
+on a.subscriber_id = b.subscriber_id
+where data_date >= '2019-01-01'  --put dates
+distributed randomly;
+
+drop table if exists playground1.kzh_rge_ninety;
+create table playground1.kzh_rge_ninety as
+select subscriber_id,subscriber_msisdn,sub_state,eff_date,status,rge,customer_level_name,site,mkttownship,cluster
+from etake4
+distributed randomly;
+
+insert into playground1.kzh_rge_ninety_full
+select * from playground1.kzh_rge_ninety; 
+
+/*
+drop table if exists playground1.kzh_rge_ninety_full;
+create table playground1.kzh_rge_ninety_full as
+select * from playground1.kzh_rge_ninety
+distributed randomly;
+*/
+
+RETURN 0;			
+
+	EXCEPTION
+		WHEN OTHERS THEN	
+	RAISE EXCEPTION '[ERROR]: % | %', SQLSTATE, SQLERRM;
+	RETURN 1;	
+
+END;
+
+$BODY$
+  LANGUAGE plpgsql VOLATILE;
+ALTER FUNCTION playground1.kzhfn_b2b_rge30_day(date)
+  OWNER TO zhtet5;
+
+GRANT EXECUTE ON FUNCTION playground1.kzhfn_b2b_rge30_day(date) TO public;
+GRANT SELECT ON TABLE playground1.kzh_rge_ninety TO public;
+GRANT SELECT ON TABLE playground1.kzh_rge_ninety_full TO public;
