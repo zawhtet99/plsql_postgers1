@@ -1,0 +1,8 @@
+select count, flag, data_date from ( 
+select count(distinct msisdn),'STAYER' AS flag, data_date from playground1.kzh_rge30_custlevel_daily where flag like 'STAYER' and data_date::date>='2019-06-01' group by 3 union
+select count(distinct msisdn),'CHURN' as flag,data_date from playground1.kzh_rge30_custlevel_daily where flag like 'CHURN' and data_date::date>='2019-06-01' group by 3 union
+select count(distinct msisdn),'REJOINER' as flag,data_date from playground1.kzh_rge30_custlevel_daily where flag like 'REJOINER' and data_date::date>='2019-06-01' group by 3 union
+select count(distinct msisdn),'GARGU' as flag,data_date from playground1.kzh_rge30_custlevel_daily where flag like 'GARGU' and data_date::date>='2019-06-01' group by 3
+) as c
+
+rdl.b2b_daily_subscriber, CRM_subscriber Activation Date
