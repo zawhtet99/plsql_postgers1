@@ -1,0 +1,181 @@
+-- Function: playground1.fn_loan_age1(date)
+
+-- DROP FUNCTION playground1.fn_loan_age1(date);
+
+CREATE OR REPLACE FUNCTION playground1.fn_loan_age1(idate date)
+  RETURNS integer AS
+$BODY$
+
+/*
+	-- Daily run
+	SELECT ADS.F_TR_006(null);
+	
+	-- Re-run
+	SELECT ADS.F_TR_006('2014-08-01');
+*/
+
+DECLARE
+	Z_ops_date		DATE;
+	Z_etl_cycle_id	INT;
+
+BEGIN
+	RAISE NOTICE '[INFO]: Loading data....';
+
+	SELECT ops_date, etl_cycle_id FROM OPS.DOPS_PARAMETERS
+	INTO Z_ops_date, Z_etl_cycle_id;
+	
+IF iDATE IS NOT NULL THEN
+		Z_ops_date = iDATE;
+
+	END IF; 
+	
+	RAISE NOTICE '[INFO]: Loading data....';
+	
+RAISE NOTICE '[INFO]: Step 1....'; /* Development purpose Need to remove */
+	
+/* Loans Taken */
+	DROP TABLE IF EXISTS tmp_loans_taken;
+	
+	CREATE TEMP TABLE tmp_loans_taken ( 
+	 subscriber_id character varying(32) 
+	, subscriber_msisdn character varying(25)
+	, loan_taken numeric
+	, loan_date timestamp); 
+	
+	INSERT INTO tmp_loans_taken 
+		(subscriber_id, subscriber_msisdn, loan_taken, loan_date)
+	SELECT subscriberid::character varying(32) as subscriber_id, chargingpartynumber as msisdn, sum(loanamount/100.00) as loan_taken, timestamp::DATE as loan_date
+	FROM stg.vou_day
+	WHERE timestamp::DATE = Z_ops_date
+	AND tradetype = 1007 
+	AND loanamount > 0
+	GROUP BY subscriberid, chargingpartynumber, timestamp;
+
+	
+RAISE NOTICE '[INFO]: Step 2....'; /* Development purpose Need to remove */
+
+/* Loans Repaid */
+	DROP TABLE IF EXISTS tmp_loans_paid;
+	
+	CREATE TEMP TABLE tmp_loans_paid ( 
+	 subscriber_id bigint 
+	, subscriber_msisdn character varying(25)
+	, repay_amount numeric
+	, repay_date timestamp); 
+
+	INSERT INTO tmp_loans_paid 
+		(subscriber_id, subscriber_msisdn, repay_amount, repay_date)
+	SELECT
+	subscriber_id, msisdn, sum(loan_paid), timestamp::DATE 
+	FROM
+	(SELECT subscriberid::bigint as subscriber_id, chargingpartynumber as msisdn, loanamount/100.00 loan_paid, timestamp::DATE 
+	FROM stg.mgr_day
+	WHERE timestamp::DATE = Z_ops_date 
+	AND loanamount > 0
+	UNION ALL
+	SELECT subscriberid::bigint as subscriber_id, chargingpartynumber as msisdn, loanamount/100.00 loan_paid, timestamp::DATE 
+	FROM stg.vou_day
+	WHERE timestamp::DATE = Z_ops_date 
+	AND tradetype <> 1007
+	AND loanamount > 0) all_p
+	GROUP BY subscriber_id, msisdn, timestamp;	
+
+RAISE NOTICE '[INFO]: Step 3....'; 
+
+/* Updating Subscriber Emergency Credit Balance */	
+
+/* Procesing New Loans Taken */	
+	/* Updating Subscribers with previous ECs */
+	UPDATE playground1.subscriber_emergency_credit ec
+	SET 
+		  last_loan_amount = tlt.loan_taken
+		, last_loan_date = tlt.loan_date
+		, lifetime_loan_amount = lifetime_loan_amount + tlt.loan_taken
+	FROM tmp_loans_taken tlt
+	WHERE tlt.subscriber_id = ec.cbs_subscriber_id;
+
+	/* Creating Subscribers with Frist EC */
+	INSERT INTO playground1.subscriber_emergency_credit 
+		(cbs_subscriber_id, subscriber_msisdn, last_loan_amount, last_loan_date, last_loan_repaid
+		, last_repay_date, lifetime_loan_amount, lifetime_loan_repaid, load_dt, etl_cycle_id)
+	SELECT tlt.subscriber_id, tlt.subscriber_msisdn, tlt.loan_taken, tlt.loan_date, 0
+		, NULL, tlt.loan_taken, 0, current_date, Z_etl_cycle_id
+	FROM tmp_loans_taken tlt
+	LEFT JOIN playground1.subscriber_emergency_credit ec
+	ON tlt.subscriber_id = ec.cbs_subscriber_id
+	WHERE ec.cbs_subscriber_id IS NULL;
+
+/* Procesing EC Repayments */	
+	UPDATE playground1.subscriber_emergency_credit ec
+	SET 
+		  last_loan_repaid = 
+			  CASE WHEN ec.last_loan_amount - ec.last_loan_repaid > tlp.repay_amount THEN tlp.repay_amount
+			  ELSE ec.last_loan_amount - ec.last_loan_repaid 
+			  END		  
+		, last_repay_date = tlp.repay_date
+		, lifetime_loan_repaid = lifetime_loan_repaid + 
+			  CASE WHEN ec.last_loan_amount - ec.last_loan_repaid > tlp.repay_amount THEN tlp.repay_amount
+			  ELSE ec.last_loan_amount - ec.last_loan_repaid 
+			  END				
+	FROM tmp_loans_paid tlp
+	WHERE tlp.subscriber_id = ec.cbs_subscriber_id;
+
+	
+RAISE NOTICE '[INFO]: Step 4....'; 
+
+/* Processing Loan Ageing */	
+	DELETE FROM playground1.bl_loan_aging_summary WHERE data_date = Z_ops_date;
+	
+	INSERT INTO playground1.bl_loan_aging_summary
+	(data_date, loan_age_code, loan_age_amount, loan_age_count, load_dt, etl_cycle_id)
+	SELECT Z_ops_date, '0-7 days', sum(last_loan_amount - last_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM playground1.subscriber_emergency_credit
+	WHERE (last_loan_amount - last_loan_repaid) > 0
+	AND Z_ops_date - last_repay_date BETWEEN 0 and 7
+	UNION ALL
+	SELECT Z_ops_date, '8-14 days', sum(last_loan_amount - last_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM playground1.subscriber_emergency_credit
+	WHERE (last_loan_amount - last_loan_repaid) > 0
+	AND Z_ops_date - last_repay_date BETWEEN 8 and 14
+	UNION ALL
+	SELECT Z_ops_date, '15-21 days', sum(last_loan_amount - last_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM playground1.subscriber_emergency_credit
+	WHERE (last_loan_amount - last_loan_repaid) > 0
+	AND Z_ops_date - last_repay_date BETWEEN 15 and 21
+	UNION ALL
+	SELECT Z_ops_date, '22-30 days', sum(last_loan_amount - last_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM playground1.subscriber_emergency_credit
+	WHERE (last_loan_amount - last_loan_repaid) > 0
+	AND Z_ops_date - last_repay_date BETWEEN 22 and 30
+	UNION ALL
+	SELECT Z_ops_date, '31-60 days', sum(last_loan_amount - last_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM playground1.subscriber_emergency_credit
+	WHERE (last_loan_amount - last_loan_repaid) > 0
+	AND Z_ops_date - last_repay_date BETWEEN 31 and 60
+	UNION ALL
+	SELECT Z_ops_date, '61-90 days', sum(last_loan_amount - last_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM playground1.subscriber_emergency_credit
+	WHERE (last_loan_amount - last_loan_repaid) > 0
+	AND Z_ops_date - last_repay_date BETWEEN 61 and 90
+	UNION ALL
+	SELECT Z_ops_date, 'Over 90 days', sum(last_loan_amount - last_loan_repaid), count(*), current_date, Z_etl_cycle_id
+	FROM playground1.subscriber_emergency_credit
+	WHERE (last_loan_amount - last_loan_repaid) > 0
+	AND Z_ops_date - last_repay_date > 90;	
+	
+
+RETURN 0;
+
+	EXCEPTION
+		WHEN OTHERS THEN	
+		RAISE EXCEPTION '[ERROR]: % | %', SQLSTATE, SQLERRM;
+
+	RETURN 1;
+	
+
+END;
+
+$BODY$
+  LANGUAGE plpgsql VOLATILE;
+ALTER FUNCTION playground1.fn_loan_age1(date)
+  OWNER TO zhtet5;
