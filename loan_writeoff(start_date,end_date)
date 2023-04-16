@@ -1,0 +1,156 @@
+-- Function: playground1.fn_loan_writeoff(date, date)
+
+-- DROP FUNCTION playground1.fn_loan_writeoff(date, date);
+
+CREATE OR REPLACE FUNCTION playground1.fn_loan_writeoff(xdate date, ydate date)
+  RETURNS integer AS
+$BODY$
+
+
+DECLARE
+	Z_ops_date		DATE;
+	Z_etl_cycle_id	INT;
+	
+	start_date 		DATE;
+	end_date		DATE;
+
+BEGIN
+	RAISE NOTICE '[INFO]: Loading data....';
+
+	SELECT ops_date, etl_cycle_id FROM OPS.DOPS_PARAMETERS
+	INTO Z_ops_date, Z_etl_cycle_id;
+	
+	start_date = xDate;
+	end_date = yDate;
+	
+	
+	RAISE NOTICE '[INFO]: Loading data....';
+	
+RAISE NOTICE '[INFO]: Step 1....'; /* Development purpose Need to remove */
+	
+/* All Loans taken */	
+	DROP TABLE IF EXISTS bl_loans_taken;
+	
+	CREATE TEMP TABLE bl_loans_taken ( 
+	  subscriber_id bigint  
+	, subscriber_msisdn character varying(25)
+	, loan_taken numeric
+	, loan_date timestamp) 
+	WITH ( OIDS=FALSE)  
+	DISTRIBUTED BY (subscriber_msisdn);  
+	
+	RAISE NOTICE '[INFO]: Step 1....';  /* Development purpose Need to remove */
+	
+	INSERT INTO bl_loans_taken 
+		(subscriber_id, subscriber_msisdn, loan_taken, loan_date)
+	SELECT subscriberid::bigint as subscriber_id, chargingpartynumber as msisdn
+	, loanamount/100.00 loan_taken
+	, timestamp as loan_date
+	FROM ssd.cbs_vou_cdr
+	WHERE tradetype = 1007 
+	AND loanamount/100.00 in (500,800,1600) 
+	AND (timestamp::date >= start_date::date and timestamp::date <= end_date::date)
+	AND loanamount > 0;
+	
+	RAISE NOTICE '[INFO]: Step 2....';          /* Development purpose Need to remove */
+
+/* All Loan repayments */
+	DROP TABLE IF EXISTS bl_loans_paid;
+	
+	CREATE TEMP TABLE bl_loans_paid ( 
+	  subscriber_id bigint  
+	, subscriber_msisdn character varying(15)
+	, repay_amount numeric
+	, repay_date timestamp) 
+	WITH ( OIDS=FALSE)  
+	DISTRIBUTED BY (subscriber_msisdn);   
+
+	INSERT INTO bl_loans_paid 
+		(subscriber_id, subscriber_msisdn, repay_amount, repay_date)
+	SELECT subscriberid::bigint as subscriber_id, chargingpartynumber as msisdn
+	, loanamount/100.00 loan_paid
+	, timestamp 
+	FROM ssd.cbs_mgr_cdr
+	WHERE loanamount > 0 
+	AND (timestamp::date >= start_date::date and timestamp::date <= end_date::date)
+	UNION ALL
+	SELECT subscriberid::bigint as subscriber_id, chargingpartynumber as msisdn
+	, loanamount/100.00 loan_paid
+	, timestamp 
+	FROM ssd.cbs_vou_cdr
+	WHERE tradetype<> 1007
+	AND loanamount> 0
+	AND (timestamp::date >= start_date::date and timestamp::date <= end_date::date);
+	
+	DROP TABLE IF EXISTS bl_last_loan_taken;
+		
+	CREATE TEMP TABLE bl_last_loan_taken AS SELECT lt.subscriber_id, ml.loan_date as last_loan_date, lt.loan_taken as last_loan_amount 
+	FROM bl_loans_taken lt
+	INNER JOIN ( SELECT subscriber_id, max(loan_date) as loan_date 
+	             FROM bl_loans_taken 
+				 GROUP BY subscriber_id ) ml
+	ON lt.subscriber_id = ml.subscriber_id
+	WHERE lt.loan_date = ml.loan_date;
+	
+	DROP TABLE IF EXISTS playground1.writeoff_loans;
+	
+	CREATE TABLE playground1.writeoff_loans as
+	select lt.subscriber_id, lt.subscriber_msisdn, max(loan_date) as last_loan_date, sum(loan_taken) as total_loan_taken
+	from bl_loans_taken lt
+	join bl_last_loan_taken llt 
+	on lt.subscriber_id = llt.subscriber_id 
+	and lt.loan_date < llt.last_loan_date
+	group by lt.subscriber_id, lt.subscriber_msisdn;
+	
+	--daily
+	DROP TABLE IF EXISTS playground1.writeoff_loans1;
+	CREATE TABLE playground1.writeoff_loans1 as
+	select lt.subscriber_id, lt.subscriber_msisdn, loan_date, loan_taken
+	from bl_loans_taken lt
+	join bl_last_loan_taken llt 
+	on lt.subscriber_id = llt.subscriber_id 
+	and lt.loan_date < llt.last_loan_date
+	group by lt.subscriber_id, lt.subscriber_msisdn,lt.loan_date,lt.loan_taken;
+	
+	
+	DROP TABLE IF EXISTS playground1.writeoff_payments;
+
+	CREATE TABLE playground1.writeoff_payments as
+	select lt.subscriber_id, lt.subscriber_msisdn, max(repay_date) as last_repay_date, sum(repay_amount) as total_loan_paid
+	from bl_loans_paid lt
+	join bl_last_loan_taken llt 
+	on lt.subscriber_id = llt.subscriber_id 
+	and lt.repay_date < llt.last_loan_date
+	group by lt.subscriber_id, lt.subscriber_msisdn;
+	
+	DROP TABLE IF EXISTS playground1.subscriber_writeoff;
+
+	create table playground1.subscriber_writeoff as
+	SELECT wlt.subscriber_id, wlt.subscriber_msisdn, wlt.last_loan_date, wlt.total_loan_taken,
+	wp.last_repay_date, wp.total_loan_paid
+	from playground1.writeoff_loans wlt
+	left join playground1.writeoff_payments wp
+	on wlt.subscriber_id =wp.subscriber_id
+	WHERE wlt.total_loan_taken - coalesce(wp.total_loan_paid,0) > 0;
+
+ /*  DROP table if exists playground1.subscriber_overpayment;
+	CREATE TABLE playground1.subscriber_overpayment as 
+	select subscriber_id, subscriber_msisdn, last_loan_date, last_repay_date, last_loan_amount, ec.total_loan_repaid
+	from playground1.bl_subscriber_emergency_credit_sb ec
+	where total_loan_repaid > last_loan_amount;
+*/	
+
+RETURN 0;
+
+	EXCEPTION
+		WHEN OTHERS THEN	
+		RAISE EXCEPTION '[ERROR]: % | %', SQLSTATE, SQLERRM;
+
+	RETURN 1;
+	
+END;
+
+$BODY$
+  LANGUAGE plpgsql VOLATILE;
+ALTER FUNCTION playground1.fn_loan_writeoff(date, date)
+  OWNER TO zhtet5;
